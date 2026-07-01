@@ -1,0 +1,6 @@
+{
+  "name": "BusinessBridge Vendor Scout",
+  "description": "A B2B vendor discovery and enrichment platform that extracts business listings, crawls company websites, and generates detailed AI profiles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
