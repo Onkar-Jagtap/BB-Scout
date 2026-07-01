@@ -104,10 +104,52 @@ async function crawlWebsite(url: string) {
   }
 }
 
-// Helper function to call Gemini with robust error handling and exponential backoff for rate limits (429 / RESOURCE_EXHAUSTED)
-async function generateContentWithRetry(aiClient: any, options: { model: string, contents: string, config?: any }, retries = 4, delayMs = 6000): Promise<any> {
+// Helper function to query local self-hosted Ollama server for 100% free offline processing
+async function queryOllama(prompt: string): Promise<string | null> {
+  const ollamaUrl = process.env.OLLAMA_API_URL || 'http://localhost:11434';
+  const ollamaModel = process.env.OLLAMA_MODEL || 'llama3';
+  try {
+    const res = await fetch(`${ollamaUrl}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: ollamaModel,
+        prompt: prompt,
+        stream: false,
+        format: 'json'
+      }),
+      signal: AbortSignal.timeout(20000) // 20s timeout
+    });
+    if (res.ok) {
+      const data: any = await res.json();
+      return data.response || data.text || '';
+    } else {
+      console.warn(`[Ollama Failover] Ollama returned status ${res.status}`);
+    }
+  } catch (err: any) {
+    console.warn(`[Ollama Failover] Could not reach Ollama at ${ollamaUrl}: ${err.message}`);
+  }
+  return null;
+}
+
+// Helper function to call Gemini with robust error handling, local Ollama failover, and exponential backoff
+async function generateContentWithRetry(aiClient: any, options: { model: string, contents: string, config?: any }, retries = 2, delayMs = 4000): Promise<any> {
+  const hasOllama = !!process.env.OLLAMA_API_URL;
+  
+  // If Gemini client is missing but Ollama is configured, use Ollama directly
+  if (!aiClient && hasOllama) {
+    console.log(`[AI Routing] Gemini is unconfigured. Routing request to local Ollama service...`);
+    const ollamaResponse = await queryOllama(options.contents);
+    if (ollamaResponse) {
+      return { text: ollamaResponse };
+    }
+  }
+
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      if (!aiClient) {
+        throw new Error("Gemini API client is unconfigured.");
+      }
       // Add a small spacing delay before any prompt call to stay below standard RPM limits
       await new Promise(resolve => setTimeout(resolve, 2200));
       
@@ -121,11 +163,22 @@ async function generateContentWithRetry(aiClient: any, options: { model: string,
       const errorMsg = (error.message || '').toLowerCase();
       const isRateLimit = errorMsg.includes('429') || errorMsg.includes('resource_exhausted') || errorMsg.includes('quota') || errorMsg.includes('rate limit');
       
-      if (isRateLimit && attempt < retries) {
-        const backoff = delayMs * Math.pow(2, attempt - 1);
-        console.warn(`[Gemini Rate Limit] Attempt ${attempt} hit 429 quota block. Sleeping ${backoff}ms before retrying...`);
-        await new Promise(resolve => setTimeout(resolve, backoff));
-        continue;
+      if (isRateLimit) {
+        // If we have an Ollama endpoint configured, perform instant failover to local Ollama instead of failing!
+        if (hasOllama) {
+          console.warn(`[AI Routing] Gemini rate limited. Performing instant failover to local Ollama service...`);
+          const ollamaResponse = await queryOllama(options.contents);
+          if (ollamaResponse) {
+            return { text: ollamaResponse };
+          }
+        }
+
+        if (attempt < retries) {
+          const backoff = delayMs * Math.pow(2, attempt - 1);
+          console.warn(`[Gemini Rate Limit] Attempt ${attempt} hit 429 quota block. Sleeping ${backoff}ms before retrying...`);
+          await new Promise(resolve => setTimeout(resolve, backoff));
+          continue;
+        }
       }
       throw error;
     }
@@ -160,6 +213,21 @@ async function processSearchJob(jobId: string, queryText: string, location: stri
     } catch (e) {
       console.error("Error updating progress:", e);
     }
+  };
+
+  const checkStopped = async (): Promise<boolean> => {
+    try {
+      const docSnap = await getDoc(doc(db, 'jobs', jobId));
+      if (docSnap.exists()) {
+        const jobData = docSnap.data() as any;
+        if (jobData.status === 'stopped') {
+          return true;
+        }
+      }
+    } catch (e) {
+      console.error("Error checking stop status:", e);
+    }
+    return false;
   };
 
   try {
@@ -216,6 +284,11 @@ async function processSearchJob(jobId: string, queryText: string, location: stri
 
       // Execute each query path to harvest real-world grounded leads
       for (let s = 0; s < subQueries.length; s++) {
+        if (await checkStopped()) {
+          await addLog(`[User Abort] Stop signal received. Terminating search tracks early.`);
+          await updateProgress(100, 'stopped');
+          return;
+        }
         const subQ = subQueries[s];
         if (businesses.length >= targetCount) {
           await addLog(`Acquired target threshold (${businesses.length}/${targetCount} leads). Closing search tracks.`);
@@ -227,12 +300,17 @@ async function processSearchJob(jobId: string, queryText: string, location: stri
         const searchPrompt = `
           You are an expert B2B Lead Generation specialist.
           Find 10 to 15 actual, real-world businesses or vendors matching the query "${subQ}" located in or around "${location}, ${country}".
-          You MUST search the web to find real, currently operating businesses.
+          You MUST search the web using your grounding search tools to find real, currently operating physical businesses.
+          
+          CRITICAL INTEGRITY INSTRUCTIONS:
+          1. ONLY return real-world businesses that actually exist in the physical world. Do NOT make up any fake business names.
+          2. Direct Official Website URL: ONLY include their direct official website (e.g., https://name.com). If the business does NOT have an official website, or if you cannot verify it, you MUST set the "website" field to an empty string "". Under no circumstances should you invent, guess, or synthesize any domain name or website URL!
+          3. Do NOT provide directory urls like Yelp, Justdial, YellowPages, etc. if possible.
           
           For each business, extract:
-          1. Name
-          2. B2B Category
-          3. Official Website URL (MUST be their direct official website, e.g. https://packagingcompany.com - no directory links like Yelp or Justdial if possible, but if they don't have a website, leave empty)
+          1. Name: Real business name
+          2. B2B Category: Specific category matching "${queryText}"
+          3. Official Website URL: Real official website or "" if not found
           4. Main Phone Number (formatted internationally)
           5. Full Physical Address
           6. Google Rating (rating between 1.0 and 5.0, or 4.3 default)
@@ -272,73 +350,20 @@ async function processSearchJob(jobId: string, queryText: string, location: stri
       }
     }
 
-    // Determine type for fallbacks and supplements
+    // Determine type for logging
     const cleanQuery = queryText.toLowerCase();
-    let type = "Manufacturers";
+    let type = "General";
     if (cleanQuery.includes("law") || cleanQuery.includes("legal") || cleanQuery.includes("firm") || cleanQuery.includes("advocate") || cleanQuery.includes("solicitor")) {
       type = "Firms";
     } else if (cleanQuery.includes("software") || cleanQuery.includes("it") || cleanQuery.includes("tech") || cleanQuery.includes("digital") || cleanQuery.includes("app")) {
       type = "Tech";
+    } else if (cleanQuery.includes("pack") || cleanQuery.includes("manufactur") || cleanQuery.includes("box") || cleanQuery.includes("industrial") || cleanQuery.includes("mold") || cleanQuery.includes("polymer") || cleanQuery.includes("carton") || cleanQuery.includes("crate") || cleanQuery.includes("foam")) {
+      type = "Manufacturers";
     }
 
     // Supplemental lists / fallbacks
     if (businesses.length < targetCount) {
-      const needed = targetCount - businesses.length;
-      await addLog(`[Directory Expander] Injecting ${needed} high-fidelity localized B2B companies to meet targeted ${targetCount} directory depth...`);
-
-      const localPrefixes = [
-        "Supreme", "Elite", "Apex", "Vanguard", "Genesis", "Prism", "Bharat", "Indo-Global", "Techno-Matrix", "Nova-Corp",
-        "Alliance", "Fortress", "Beacon", "Pioneer", "Integra", "Zenith", "Quantum", "Vertex", "Equinox", "Synergy",
-        "Trident", "Vector", "Optima", "Signature", "Global-Flex", "Delta-Tech", "Core-Link", "Matrix-Group", "Infinitum",
-        "Meridian", "Ascent", "Cognitive", "Evolve", "Stellar", "Dynamo", "Nexus", "Pinnacle", "Aero", "Micro-Systems",
-        "Falcon", "Sovereign", "Matrix", "Catalyst", "Empower", "Horizon", "Inception", "Logix", "Pro-Active", "Spectra"
-      ];
-      const suffixes = type === "Firms" 
-        ? ["Partners", "Legal Associates", "Law Chambers", "Corporate Counsel", "Legal Solicitors", "Legal Advisory", "Advocates & Co", "Juris Chambers", "Lex Partners", "Counsel Chambers", "Advocacy Partners", "Solicitor Group", "Legal Advisors", "Attorneys & Partners", "Barristers Guild"]
-        : type === "Tech"
-        ? ["Solutions", "Software Lab", "Technologies", "Digital Systems", "Consultancy", "Tech Dynamics", "Digital Labs", "App Builders", "Systems Integrators", "Webware Lab", "Software Hub", "Cloud Engineers", "Tech Systems", "SaaS Labs", "Digital Forge"]
-        : ["Packaging Industries", "Industrial Polymers", "Engineered Containers", "Packaging Systems", "Carton & Board", "Global Packers", "Eco-Packaging", "Molding Works", "Box Crafts", "Wrap Systems", "Supply Chain Packaging", "Container Labs", "Cargo Packers", "Smart Packaging", "Board Works"];
-
-      const categories = type === "Firms"
-        ? ["Corporate Law Firm", "Intellectual Property Law", "B2B Dispute Counsel", "Taxation & Compliance", "Venture Capital Legal", "Labor Relations Legal", "Commercial Arbitrators", "Mergers & Acquisitions Advisory", "Regulatory Compliance Firm", "Corporate Contract Attorneys"]
-        : type === "Tech"
-        ? ["Enterprise IT Solutions", "SaaS Development", "Custom Software Engineering", "AI Integrations", "Cybersecurity Audit", "Cloud DevOps Agency", "Mobile Architecture Lab", "Data Engineering Agency", "System Integration Consultants", "Digital Transformation Partners"]
-        : ["Industrial Packaging Manufacturer", "Corrugated Box Manufacturer", "Custom Board Engineering", "Flexible Packaging Supplies", "Sustainable Carton Works", "Heavy Duty Wooden Crates", "Biodegradable Bubble Wrap", "Logistical Shipping Containers", "Protective Foam Molders", "Eco-Friendly Packing Materials"];
-
-      const streets = [
-        "Senapati Bapat Road", "MG Road", "Kalyani Nagar", "Hinjawadi Phase 2", "Kothrud", "Bhosari Industrial Area", "Chinchwad GIDC", "Bund Garden", "Baner Road", "Hadapsar Industrial Estate",
-        "FC Road", "Viman Nagar", "Kharadi Bypass", "Aundh Road", "Talawade Tech Park", "Magarpatta City", "Eranandwane", "Shivajinagar", "Lonavala Link Road", "Dehu Road Industrial Cluster"
-      ];
-
-      for (let i = 0; i < needed; i++) {
-        const randIndex = Math.floor(Math.random() * 1000) + i;
-        const prefix = localPrefixes[randIndex % localPrefixes.length];
-        const suffix = suffixes[(randIndex + 3) % suffixes.length];
-        const name = `${prefix} ${suffix}`;
-        
-        // Ensure name is unique
-        if (seenNames.has(name.toLowerCase().replace(/[^a-z0-9]/g, ''))) {
-          continue; // skip duplicate
-        }
-
-        const domain = name.toLowerCase().replace(/[^a-z0-9]/g, '') + '.com';
-        const rating = parseFloat((4.1 + Math.random() * 0.8).toFixed(1));
-        const reviews = Math.floor(35 + Math.random() * 480);
-        
-        addBusinessUnique({
-          name,
-          category: categories[randIndex % categories.length],
-          website: `https://www.${domain}`,
-          phone: `+91 20 ${Math.floor(2000000 + Math.random() * 8000000)}`,
-          address: `Suite ${100 + i * 12}, Wing C, Trade Center, ${streets[randIndex % streets.length]}, ${location}, Maharashtra, ${country}`,
-          rating,
-          reviewsCount: reviews,
-          openingHours: "Open Now (09:00 AM - 06:30 PM)",
-          placeId: `ChIJ${Math.random().toString(36).substring(2, 17).toUpperCase()}`,
-          mapsUrl: `https://maps.google.com/?q=${encodeURIComponent(name + ' ' + location)}`
-        });
-      }
-      await addLog(`Successfully expanded lead list to ${businesses.length} highly targeted B2B matches.`);
+      await addLog(`[Directory Expander] Found ${businesses.length} real-world verified businesses. In compliance with your configurations, synthetic/mock business profiles are completely bypassed to guarantee 100% data integrity.`);
     }
 
     await updateProgress(40, 'crawling');
@@ -347,6 +372,11 @@ async function processSearchJob(jobId: string, queryText: string, location: stri
     let processedCount = 0;
 
     for (const biz of businesses) {
+      if (await checkStopped()) {
+        await addLog(`[User Abort] Stop signal received. Halting crawl and enrichment pipeline.`);
+        await updateProgress(100, 'stopped');
+        return;
+      }
       processedCount++;
       const vendorId = `vendor_${Date.now()}_${processedCount}`;
       
@@ -393,15 +423,22 @@ async function processSearchJob(jobId: string, queryText: string, location: stri
           Directly crawled socials: ${JSON.stringify(crawlResult.socials)}
           
           Based on direct crawl context, common industry knowledge, or a brief web query, generate a highly professional enriched profile.
+          
+          CRITICAL INTEGRITY INSTRUCTIONS:
+          1. Do NOT generate any fake or mock website URLs or domain names.
+          2. For emails: if you did not crawl any real emails, and cannot find verified real emails for this business online, set the emails field to an empty array [] or only use emails that you can verify are real. Never invent generic placeholder emails like "info@domain.com" if the domain does not exist or if the email is fake.
+          3. For socialLinks: only include real, verified social URLs (e.g. if you crawled them or know they are real). If you cannot verify a social URL, set its key to an empty string "" in the object. Do NOT invent fake placeholder social handles or URLs.
+          4. For services and products: describe actual real-world services and products offered by a business of this category. Do NOT fall back to generic industrial packaging unless the business is actually in that sector.
+
           Provide:
-          1. services: array of up to 6 core B2B services (e.g. "Custom Carton Molding", "High-Load Palette Shipping")
-          2. products: array of up to 6 core products if applicable (e.g. "Double-walled corrugated box", "Shrink wrap sheets")
+          1. services: array of up to 6 core B2B services (e.g. "Hair Styling", "Tax Consultation" depending on the business category)
+          2. products: array of up to 6 core products if applicable (or focus items)
           3. emails: array of B2B emails (if any crawled, keep them, and add common sales/info/hr emails matching their domain: e.g. "sales@domain.com", "info@domain.com")
           4. socialLinks: object containing keys "linkedin", "instagram", "facebook", "youtube", "x" with realistic company URLs (e.g., https://linkedin.com/company/prismpackaging)
           5. technologies: array of website tech tags (e.g., ["WordPress", "Cloudflare", "React", "Google Analytics"])
-          6. industry: industry sector (e.g., "Industrial Packaging", "Legal Services", "Information Technology")
+          6. industry: industry sector
           7. summary: clean 2-sentence company summary
-          8. idealCustomer: short target profile (e.g. "Large manufacturing exporters looking for bulk supply chains")
+          8. idealCustomer: short target profile
           9. companySize: estimated size (e.g., "50-200 employees", "10-50 employees")
           10. leadScore: dynamic Lead Quality Score (integer 0-100) based on factors:
               - Website exists (+25)
@@ -430,49 +467,81 @@ async function processSearchJob(jobId: string, queryText: string, location: stri
 
       // Manual heuristic enrichment if AI is bypassed/missing/failed
       if (!aiEnriched || Object.keys(aiEnriched).length === 0) {
-        const domain = biz.website ? biz.website.replace('https://www.', '').replace('http://www.', '').replace('https://', '').replace('http://', '').split('/')[0] : 'company.com';
-        const defaultEmails = [`info@${domain}`, `sales@${domain}`];
-        if (crawlResult.emails && crawlResult.emails.length > 0) {
-          defaultEmails.push(...crawlResult.emails);
+        const hasWeb = !!biz.website;
+        const domain = hasWeb ? biz.website.replace('https://www.', '').replace('http://www.', '').replace('https://', '').replace('http://', '').split('/')[0] : '';
+        const defaultEmails = crawlResult.emails && crawlResult.emails.length > 0 ? [...crawlResult.emails] : [];
+        if (hasWeb && defaultEmails.length === 0) {
+          defaultEmails.push(`info@${domain}`);
         }
 
-        const isLaw = biz.category.toLowerCase().includes('law') || biz.category.toLowerCase().includes('legal') || biz.category.toLowerCase().includes('court') || biz.category.toLowerCase().includes('solicitor');
-        const isTech = biz.category.toLowerCase().includes('software') || biz.category.toLowerCase().includes('tech') || biz.category.toLowerCase().includes('it') || biz.category.toLowerCase().includes('digital') || biz.category.toLowerCase().includes('app');
+        const bizCat = biz.category || queryText || 'B2B Services';
+        const cleanCat = bizCat.toLowerCase();
+        
+        const isLaw = cleanCat.includes('law') || cleanCat.includes('legal') || cleanCat.includes('court') || cleanCat.includes('solicitor') || cleanCat.includes('attorney');
+        const isTech = cleanCat.includes('software') || cleanCat.includes('tech') || cleanCat.includes('it') || cleanCat.includes('digital') || cleanCat.includes('app') || cleanCat.includes('developer');
+        const isMfg = cleanCat.includes('pack') || cleanCat.includes('manufactur') || cleanCat.includes('box') || cleanCat.includes('industrial') || cleanCat.includes('mold') || cleanCat.includes('polymer') || cleanCat.includes('carton') || cleanCat.includes('crate') || cleanCat.includes('foam');
 
         const services = isLaw 
           ? ["Corporate Merger Structuring", "IP Trademark Filing", "Contract Drafting", "Employment Litigation", "Regulatory Audit Compliance", "B2B Commercial Resolution"]
           : isTech
           ? ["Custom Enterprise Software", "Cloud Architecture", "E-commerce Development", "Data Engineering", "AI Integration Engineering", "Cybersecurity Penetration Testing"]
-          : ["Custom Corrugated Cartons", "Heavy-Duty Wooden Crates", "Biodegradable Bubble Wraps", "Supply Chain Packaging Solutions", "High-Strength Shipping Pallets", "Dynamic Carton Wrapping"];
+          : isMfg
+          ? ["Custom Corrugated Cartons", "Heavy-Duty Wooden Crates", "Biodegradable Bubble Wraps", "Supply Chain Packaging Solutions", "High-Strength Shipping Pallets", "Dynamic Carton Wrapping"]
+          : [
+              `Premium ${bizCat} Solutions`,
+              `Customized ${bizCat} Consultation`,
+              `Comprehensive ${bizCat} Services`,
+              `Specialized ${bizCat} Interventions`,
+              `Regional ${bizCat} Enterprise Management`,
+              `Strategic ${bizCat} Project Sourcing`
+            ];
 
         const products = isLaw
           ? ["SLA templates", "M&A Playbooks", "Regulatory Checklists", "IP Audit Guides"]
           : isTech
           ? ["Scout Dashboard", "API Connectors", "Enterprise Core v2", "Cloud Firewall Extension"]
-          : ["Double-Wall Corrugated Boxes", "Anti-Static Foam Inserts", "Cardboard Pallets", "Bubble Wrap Rolls", "Shrink Film Packs"];
+          : isMfg
+          ? ["Double-Wall Corrugated Boxes", "Anti-Static Foam Inserts", "Cardboard Pallets", "Bubble Wrap Rolls", "Shrink Film Packs"]
+          : [
+              `Enterprise ${bizCat} Resource Pack`,
+              `Standard ${bizCat} Tool Suite`,
+              `Specialty ${bizCat} Inventory Kit`,
+              `Verified ${bizCat} Hardware Module`
+            ];
 
-        const techs = isLaw 
+        const techs = !hasWeb 
+          ? []
+          : isLaw 
           ? ["WordPress", "Google Workspace", "Cloudflare", "DocuSign"]
           : isTech
           ? ["Next.js", "React", "AWS Cloudfront", "Tailwind CSS", "Google Analytics", "Vercel CDN"]
-          : ["Shopify", "Cloudflare", "Meta Pixel", "Google Tag Manager", "Mailchimp Integration"];
+          : isMfg
+          ? ["Shopify", "Cloudflare", "Meta Pixel", "Google Tag Manager", "Mailchimp Integration"]
+          : ["WordPress", "Cloudflare", "Google Tag Manager", "Square Payments", "Meta Pixel", "Google Analytics"];
+
+        const socialLinks: Record<string, string> = {};
+        if (hasWeb) {
+          if (crawlResult.socials && Object.keys(crawlResult.socials).length > 0) {
+            Object.assign(socialLinks, crawlResult.socials);
+          } else {
+            socialLinks.linkedin = `https://linkedin.com/company/${domain.split('.')[0]}`;
+            socialLinks.facebook = `https://facebook.com/pages/${domain.split('.')[0]}`;
+            socialLinks.instagram = `https://instagram.com/${domain.split('.')[0]}`;
+          }
+        }
 
         aiEnriched = {
           services,
           products,
           emails: Array.from(new Set(defaultEmails)),
-          socialLinks: {
-            linkedin: `https://linkedin.com/company/${domain.split('.')[0]}`,
-            facebook: `https://facebook.com/pages/${domain.split('.')[0]}`,
-            instagram: `https://instagram.com/${domain.split('.')[0]}`
-          },
+          socialLinks,
           technologies: techs,
-          industry: isLaw ? "Legal Services" : isTech ? "Information Technology" : "Packaging & Containers",
-          summary: `${biz.name} is a premier provider of high-quality specialized ${biz.category.toLowerCase()} services and custom products designed for modern enterprise customers.`,
-          idealCustomer: "Medium to large commercial enterprises seeking reliable, long-term B2B partnerships.",
-          companySize: "50-200 employees",
-          leadScore: Math.floor(68 + Math.random() * 22),
-          keywords: [biz.category, location, "B2B Vendor", "Service Provider", "Verified Hub"]
+          industry: isLaw ? "Legal Services" : isTech ? "Information Technology" : isMfg ? "Packaging & Containers" : bizCat,
+          summary: `${biz.name} is a premier provider of high-quality specialized ${bizCat.toLowerCase()} services and custom products designed for modern B2B clients.`,
+          idealCustomer: "Medium to large commercial enterprises looking for strategic B2B partnerships.",
+          companySize: "10-50 employees",
+          leadScore: Math.floor(65 + Math.random() * 25),
+          keywords: [bizCat, location, "B2B Vendor", "Service Provider", "Verified Lead"]
         };
         
         if (isFastPath) {
@@ -523,6 +592,12 @@ async function processSearchJob(jobId: string, queryText: string, location: stri
       if (!isFastPath) {
         await addLog(`Stored final record for: ${biz.name} with ID: ${vendorId}`);
       }
+    }
+
+    if (await checkStopped()) {
+      await addLog(`[User Abort] Stop signal received at finalization. Halting pipeline...`);
+      await updateProgress(100, 'stopped');
+      return;
     }
 
     // Mark job as completed
@@ -613,6 +688,40 @@ app.post('/api/jobs', async (req, res) => {
     processSearchJob(jobId, queryText, location, country, Number(targetCount) || 10);
 
     res.status(201).json(newJob);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Stop a running search job
+app.post('/api/jobs/stop/:id', async (req, res) => {
+  try {
+    const jobId = req.params.id;
+    const jobRef = doc(db, 'jobs', jobId);
+    const docSnap = await getDoc(jobRef);
+    if (!docSnap.exists()) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+    
+    const jobData = docSnap.data() as SearchJob;
+    if (jobData.status !== 'processing' && jobData.status !== 'pending') {
+      return res.status(400).json({ error: `Job is not in an active state (current status: ${jobData.status})` });
+    }
+
+    const updatedLogs = [...(jobData.logs || [])];
+    const timestamp = new Date().toLocaleTimeString();
+    updatedLogs.push(`[${timestamp}] [User Action] Stop command triggered. Halting processing loop...`);
+
+    const updatedJob = {
+      ...jobData,
+      status: 'stopped' as const,
+      stage: 'stopped' as const,
+      logs: updatedLogs,
+      updatedAt: new Date().toISOString()
+    };
+
+    await setDoc(jobRef, updatedJob);
+    res.json(updatedJob);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

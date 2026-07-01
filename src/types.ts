@@ -3,9 +3,9 @@ export interface SearchJob {
   query: string;
   location: string;
   country: string;
-  status: 'pending' | 'processing' | 'completed' | 'failed';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'stopped';
   progress: number; // 0 to 100
-  stage: 'idle' | 'searching' | 'extracting' | 'crawling' | 'enriching' | 'completed' | 'failed';
+  stage: 'idle' | 'searching' | 'extracting' | 'crawling' | 'enriching' | 'completed' | 'failed' | 'stopped';
   vendorCount: number;
   createdAt: string;
   updatedAt: string;

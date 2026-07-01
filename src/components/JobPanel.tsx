@@ -6,9 +6,11 @@ interface JobPanelProps {
   activeJob: SearchJob | null;
   onLaunchJob: (query: string, location: string, country: string, targetCount: number) => Promise<void>;
   isLaunching: boolean;
+  onStopJob?: (jobId: string) => Promise<void>;
+  isStopping?: boolean;
 }
 
-export default function JobPanel({ activeJob, onLaunchJob, isLaunching }: JobPanelProps) {
+export default function JobPanel({ activeJob, onLaunchJob, isLaunching, onStopJob, isStopping = false }: JobPanelProps) {
   const [query, setQuery] = useState('');
   const [location, setLocation] = useState('');
   const [country, setCountry] = useState('India');
@@ -44,6 +46,7 @@ export default function JobPanel({ activeJob, onLaunchJob, isLaunching }: JobPan
       case 'enriching': return 'AI-Powered profile synthesis & lead scoring';
       case 'completed': return 'Scout pipeline finished successfully';
       case 'failed': return 'Scout pipeline interrupted';
+      case 'stopped': return 'Scout pipeline stopped by user';
       default: return 'Listening to worker queue...';
     }
   };
@@ -148,29 +151,51 @@ export default function JobPanel({ activeJob, onLaunchJob, isLaunching }: JobPan
                 </p>
               </div>
 
-              <button
-                id="scout-launch-btn"
-                type="submit"
-                disabled={isLaunching || (activeJob && (activeJob.status === 'processing' || activeJob.status === 'pending')) || !query.trim() || !location.trim()}
-                className="flex w-full items-center justify-center rounded-xl bg-indigo-600 hover:bg-indigo-500 text-sm font-semibold text-white shadow-lg py-2.5 px-4 active:scale-98 transition disabled:opacity-50 disabled:pointer-events-none cursor-pointer"
-              >
-                {isLaunching ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin text-white" />
-                    Initializing Scout Mission...
-                  </>
-                ) : activeJob && (activeJob.status === 'processing' || activeJob.status === 'pending') ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin text-indigo-200" />
-                    Analyzing Leads... ({activeJob.progress}%)
-                  </>
-                ) : (
-                  <>
-                    <Play className="mr-2 h-4 w-4 fill-current text-white animate-pulse" />
-                    Start Scout Mission
-                  </>
+              <div className="flex gap-2">
+                <button
+                  id="scout-launch-btn"
+                  type="submit"
+                  disabled={isLaunching || (activeJob && (activeJob.status === 'processing' || activeJob.status === 'pending')) || !query.trim() || !location.trim()}
+                  className="flex flex-1 items-center justify-center rounded-xl bg-indigo-600 hover:bg-indigo-500 text-sm font-semibold text-white shadow-lg py-2.5 px-4 active:scale-98 transition disabled:opacity-50 disabled:pointer-events-none cursor-pointer"
+                >
+                  {isLaunching ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin text-white" />
+                      Initializing...
+                    </>
+                  ) : activeJob && (activeJob.status === 'processing' || activeJob.status === 'pending') ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin text-indigo-200" />
+                      Analyzing... ({activeJob.progress}%)
+                    </>
+                  ) : (
+                    <>
+                      <Play className="mr-2 h-4 w-4 fill-current text-white animate-pulse" />
+                      Start Scout Mission
+                    </>
+                  )}
+                </button>
+
+                {activeJob && (activeJob.status === 'processing' || activeJob.status === 'pending') && (
+                  <button
+                    id="scout-stop-btn"
+                    type="button"
+                    onClick={() => onStopJob && onStopJob(activeJob.id)}
+                    disabled={isStopping}
+                    className="flex items-center justify-center rounded-xl bg-red-600/95 hover:bg-red-500 text-sm font-semibold text-white shadow-lg py-2.5 px-4 active:scale-98 transition disabled:opacity-50 disabled:pointer-events-none cursor-pointer"
+                    title="Stop active scout query immediately"
+                  >
+                    {isStopping ? (
+                      <Loader2 className="h-4 w-4 animate-spin text-white" />
+                    ) : (
+                      <>
+                        <span className="inline-block w-2.5 h-2.5 bg-white rounded-xs mr-2 animate-pulse" />
+                        Stop
+                      </>
+                    )}
+                  </button>
                 )}
-              </button>
+              </div>
             </form>
           </div>
         </div>
@@ -182,12 +207,12 @@ export default function JobPanel({ activeJob, onLaunchJob, isLaunching }: JobPan
               <span className="text-[10px] uppercase font-bold tracking-wider text-indigo-400 font-mono">Extraction Architecture</span>
               <h3 className="text-sm font-bold text-slate-200 mt-1">Multi-Stage Data Refinery</h3>
               <p className="text-xs text-slate-400 mt-1.5 leading-relaxed font-sans">
-                Our scouter connects live to map grounding API nodes, extracts company listings, and visits official domains to scrape raw emails, direct phones, and social footprints. It then triggers Gemini to structure high-fidelity B2B directories.
+                Our scouter connects live to map grounding API nodes, extracts company listings, and visits official domains to scrape raw emails, direct phones, and social footprints. It then triggers Google Gemini to structure high-fidelity, verified B2B directories.
               </p>
             </div>
 
             {/* Pipeline Status Indicator */}
-            <div className="rounded-xl bg-slate-950/40 border border-slate-800/80 p-3">
+            <div className="rounded-xl bg-slate-950/40 border border-slate-800/80 p-3 space-y-2">
               <div className="flex items-center justify-between text-[11px] font-mono">
                 <span className="text-slate-400 font-bold uppercase">Pipeline Status:</span>
                 {activeJob && (activeJob.status === 'processing' || activeJob.status === 'pending') ? (
@@ -195,15 +220,24 @@ export default function JobPanel({ activeJob, onLaunchJob, isLaunching }: JobPan
                     <Loader2 className="h-3 w-3 animate-spin" />
                     Active ({activeJob.progress}%)
                   </span>
+                ) : activeJob && activeJob.status === 'stopped' ? (
+                  <span className="text-amber-500 font-bold flex items-center gap-1">
+                    Stopped
+                  </span>
                 ) : (
                   <span className="text-slate-500 font-semibold">Idle & Listening</span>
                 )}
               </div>
-              <div className="text-[10px] text-slate-400 font-sans mt-1">
-                {activeJob && (activeJob.status === 'processing' || activeJob.status === 'pending') 
+              <div className="text-[10px] text-slate-400 font-sans">
+                {activeJob 
                   ? getStageLabel(activeJob.stage)
                   : "Ready for target specifications."
                 }
+              </div>
+              <div className="h-px bg-slate-800/50" />
+              <div className="flex items-center justify-between text-[9px] font-mono text-slate-500">
+                <span>AI ENGINE:</span>
+                <span className="text-emerald-400 font-semibold uppercase tracking-wider">Google Gemini Grounding</span>
               </div>
             </div>
           </div>

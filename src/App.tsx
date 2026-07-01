@@ -22,6 +22,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isLaunching, setIsLaunching] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
 
   // Filter States
   const [searchTerm, setSearchTerm] = useState('');
@@ -104,8 +105,8 @@ export default function App() {
             const vendorsData = await vRes.json();
             setVendors(Array.isArray(vendorsData) ? vendorsData : []);
 
-            // If completed or failed, refresh all jobs list and stop interval
-            if (updatedJob.status === 'completed' || updatedJob.status === 'failed') {
+            // If completed, failed, or stopped, refresh all jobs list and stop interval
+            if (updatedJob.status === 'completed' || updatedJob.status === 'failed' || updatedJob.status === 'stopped') {
               clearInterval(intervalId);
               const jobsRes = await fetch('/api/jobs');
               const jobsData = await jobsRes.json();
@@ -141,6 +142,32 @@ export default function App() {
       console.error(e);
     } finally {
       setIsLaunching(false);
+    }
+  };
+
+  // Stop/cancel a running search job
+  const handleStopJob = async (jobId: string) => {
+    setIsStopping(true);
+    try {
+      const res = await fetch(`/api/jobs/stop/${jobId}`, {
+        method: 'POST'
+      });
+      if (res.ok) {
+        const updatedJob: SearchJob = await res.json();
+        setActiveJob(updatedJob);
+        
+        // Update jobs list with the stopped job
+        setJobs(prev => prev.map(j => j.id === jobId ? updatedJob : j));
+        
+        // Refresh vendors just in case some were saved before halt
+        const vRes = await fetch('/api/vendors');
+        const vendorsData = await vRes.json();
+        setVendors(Array.isArray(vendorsData) ? vendorsData : []);
+      }
+    } catch (error) {
+      console.error("Error stopping job:", error);
+    } finally {
+      setIsStopping(false);
     }
   };
 
@@ -407,6 +434,8 @@ export default function App() {
           activeJob={activeJob}
           onLaunchJob={handleLaunchJob}
           isLaunching={isLaunching}
+          onStopJob={handleStopJob}
+          isStopping={isStopping}
         />
 
         {/* Real-time Interactive Lead Analytics Dashboard */}
